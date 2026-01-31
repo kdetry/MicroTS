@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.js
+*.js.map
+*.d.ts
+
+# LLVM/Compiler output
+*.ll
+*.o
+*.s
+
+# Compiled executables (no extension on macOS/Linux)
+examples/hello
+examples/math
+examples/fibonacci
+examples/helloworld
+examples/control_flow
+examples/forloop
+examples/arrays
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
