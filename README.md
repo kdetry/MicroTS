@@ -11,6 +11,7 @@ MicroTS is an experimental Ahead-of-Time (AOT) compiler that compiles a strict s
 - 🔧 **C Interop** - Call C standard library functions directly
 - 📦 **Tiny Binaries** - Output depends only on libc
 - 📁 **ES Modules** - `import`/`export` support with name mangling
+- 🏗️ **Structs** - `interface` maps to LLVM structs with nested access
 
 ## Requirements
 
@@ -50,6 +51,25 @@ function main(): number {
 
 ```bash
 npx ts-node src/cmd/main.ts hello.ts --run
+```
+
+### With Structs
+
+```typescript
+interface Point { x: number; y: number; }
+interface Line { start: Point; end: Point; }
+
+function main(): number {
+    let line: Line = malloc(sizeof<Line>());
+    
+    line.start.x = 10;  // Nested field access
+    line.start.y = 20;
+    
+    printf("x=%d, y=%d\n", line.start.x, line.start.y);
+    
+    free(line);
+    return 0;
+}
 ```
 
 ### With Modules
@@ -99,6 +119,9 @@ Options:
 | Arrays | `let arr: number[] = malloc(20); arr[0] = 10;` |
 | Strings | `printf("Hello %d\n", 42);` |
 | **Modules** | `import { add } from './math'; export function add(...) {}` |
+| **Structs** | `interface Point { x: number; y: number; }` |
+| **sizeof** | `sizeof<Point>()` → compile-time size calculation |
+| **Nested Access** | `line.start.x = 10;` (arbitrary depth) |
 
 ### ❌ Not Supported
 
@@ -108,6 +131,37 @@ Options:
 - `try`/`catch`
 - Union types (`string | number`)
 - `any` type
+
+## Struct System
+
+TypeScript `interface` maps directly to LLVM `struct`:
+
+```typescript
+interface Vector3 {
+    x: number;
+    y: number;
+    z: number;
+}
+
+let vec: Vector3 = malloc(sizeof<Vector3>());  // 12 bytes
+vec.x = 10;
+vec.y = 20;
+vec.z = 30;
+let sum: number = vec.x + vec.y + vec.z;
+free(vec);
+```
+
+**Generated LLVM IR:**
+```llvm
+%Vector3 = type { i32, i32, i32 }
+; sizeof<Vector3>() = 12
+```
+
+**Features:**
+- Compile-time `sizeof<T>()` intrinsic
+- Nested struct access: `line.start.x`
+- Heap allocation via `malloc`/`free`
+- Field read/write via `getelementptr`
 
 ## Module System
 
@@ -138,6 +192,7 @@ add(1, 2);  // → call i32 @math_add(i32 1, i32 2)
 | `void` | `void` |
 | `string` | `i8*` |
 | `number[]` | `i32*` |
+| `interface X` | `%X*` (pointer to struct) |
 
 ## Examples
 
@@ -154,6 +209,7 @@ Located in `examples/`:
 | `07-arrays` | malloc/free |
 | `08-multifile` | Legacy multi-file |
 | `09-modules` | ES module imports |
+| `10-structs` | Interfaces & nested structs |
 
 ## Project Structure
 
@@ -165,7 +221,8 @@ src/
 │   ├── Emitter.ts          # LLVM IR string builder
 │   ├── Context.ts          # Symbol table / scopes
 │   ├── TypeMapper.ts       # TS types → LLVM types
-│   └── ModuleResolver.ts   # Import/export resolution
+│   ├── ModuleResolver.ts   # Import/export resolution
+│   └── StructRegistry.ts   # Interface → struct mapping
 ├── stdlib/libc.ts          # C FFI declarations (auto-loaded)
 └── utils/SystemRunner.ts   # Clang execution wrapper
 ```
@@ -174,12 +231,12 @@ src/
 
 ```
 ┌──────────┐     ┌───────────────┐     ┌─────────┐     ┌────────────┐
-│  main.ts │ ──▶ │ ModuleResolver│ ──▶ │  .ll    │ ──▶ │ executable │
+│  main.ts │ ──▶ │ StructRegistry│ ──▶ │  .ll    │ ──▶ │ executable │
 │  math.ts │     │ + ASTWalker   │     │ (LLVM)  │     │ (native)   │
 └──────────┘     └───────────────┘     └─────────┘     └────────────┘
                         │
-                   Name Mangling
-                   math.add → @math_add
+                  Struct Types
+                  interface Point → %Point = type { i32, i32 }
 ```
 
 ## License
