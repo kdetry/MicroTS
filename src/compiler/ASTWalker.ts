@@ -3,6 +3,7 @@ import { Emitter } from "./Emitter";
 import { Context } from "./Context";
 import { TypeMapper } from "./TypeMapper";
 import { ImportInfo } from "./ModuleResolver";
+import { StructRegistry } from "./StructRegistry";
 
 /**
  * ExternFunction - Tracks declared external functions (C FFI)
@@ -27,7 +28,7 @@ interface InternalFunction {
 /**
  * ASTWalker - Traverses TypeScript AST and generates LLVM IR
  * 
- * Phase 1-6: Handles functions, variables, expressions, C FFI, and modules
+ * Phase 1-7: Handles functions, variables, expressions, C FFI, modules, and structs
  */
 export class ASTWalker {
     private emitter: Emitter;
@@ -41,6 +42,9 @@ export class ASTWalker {
     // Module support
     private currentModule: string = "main";
     private importMap: Map<string, string> = new Map();  // localName → mangledName
+
+    // Struct support
+    private structRegistry: StructRegistry = new StructRegistry();
 
     constructor(sourceFile: ts.SourceFile, program: ts.Program, moduleName: string, emitter?: Emitter) {
         this.sourceFile = sourceFile;
@@ -76,7 +80,20 @@ export class ASTWalker {
      * Walk the entire source file and generate LLVM IR
      */
     walk(): string {
-        // First pass: collect all declare statements (external functions)
+        // First pass: collect all interface declarations (structs)
+        ts.forEachChild(this.sourceFile, (node) => {
+            if (ts.isInterfaceDeclaration(node)) {
+                this.visitInterfaceDeclaration(node);
+            }
+        });
+
+        // Emit struct types to IR
+        for (const struct of this.structRegistry.getTopologicalOrder()) {
+            const fieldTypes = struct.fields.map(f => f.type);
+            this.emitter.addStructType(struct.name, fieldTypes);
+        }
+
+        // Second pass: collect all declare statements (external functions)
         ts.forEachChild(this.sourceFile, (node) => {
             if (ts.isFunctionDeclaration(node) && !node.body) {
                 // This is a "declare function" - external C function
@@ -84,7 +101,7 @@ export class ASTWalker {
             }
         });
 
-        // Second pass: process all function definitions
+        // Third pass: process all function definitions
         ts.forEachChild(this.sourceFile, (node) => {
             if (ts.isFunctionDeclaration(node) && node.body) {
                 this.visitFunctionDeclaration(node);
@@ -200,6 +217,47 @@ export class ASTWalker {
     }
 
     /**
+     * Process an interface declaration (becomes LLVM struct)
+     */
+    private visitInterfaceDeclaration(node: ts.InterfaceDeclaration): void {
+        const interfaceName = node.name.getText(this.sourceFile);
+
+        const fields: { name: string; tsType: string; llvmType: string }[] = [];
+
+        for (const member of node.members) {
+            // Only process property signatures
+            if (!ts.isPropertySignature(member)) {
+                continue;  // Skip methods for now
+            }
+
+            // Skip optional properties
+            if (member.questionToken) {
+                throw new Error(`Optional properties not supported in interface ${interfaceName}`);
+            }
+
+            const fieldName = member.name.getText(this.sourceFile);
+            let tsType = "number";  // Default
+            let llvmType = "i32";   // Default
+
+            if (member.type) {
+                tsType = member.type.getText(this.sourceFile);
+
+                // Check if field type is another struct
+                if (this.structRegistry.isStruct(tsType)) {
+                    llvmType = `%${tsType}*`;  // Pointer to struct
+                } else {
+                    llvmType = TypeMapper.mapType(tsType);
+                }
+            }
+
+            fields.push({ name: fieldName, tsType, llvmType });
+        }
+
+        // Register the struct
+        this.structRegistry.register(interfaceName, fields);
+    }
+
+    /**
      * Process a block statement
      */
     private visitBlock(node: ts.Block): void {
@@ -248,8 +306,20 @@ export class ASTWalker {
 
         // Determine type
         let llvmType = "i32";  // Default
+        let isStructType = false;
+        let structTypeName = "";
+
         if (node.type) {
-            llvmType = TypeMapper.mapType(node.type.getText(this.sourceFile));
+            const tsType = node.type.getText(this.sourceFile);
+
+            // Check if this is a struct type
+            if (this.structRegistry.get(tsType)) {
+                isStructType = true;
+                structTypeName = tsType;
+                llvmType = `%${tsType}*`;  // Struct variables are pointers
+            } else {
+                llvmType = TypeMapper.mapType(tsType);
+            }
         }
 
         // Declare variable in context
@@ -261,7 +331,15 @@ export class ASTWalker {
         // If there's an initializer, store the value
         if (node.initializer) {
             const value = this.visitExpression(node.initializer);
-            this.emitter.emitStore(llvmType, value, variable.llvmName);
+
+            // If struct type and initializer is from malloc (i8*), bitcast it
+            if (isStructType) {
+                const castedPtr = this.context.nextTemp();
+                this.emitter.emitBitcast(castedPtr, "i8*", value, `%${structTypeName}*`);
+                this.emitter.emitStore(llvmType, castedPtr, variable.llvmName);
+            } else {
+                this.emitter.emitStore(llvmType, value, variable.llvmName);
+            }
         }
     }
 
@@ -470,6 +548,10 @@ export class ASTWalker {
             return this.visitStringLiteral(node);
         }
 
+        if (ts.isPropertyAccessExpression(node)) {
+            return this.visitPropertyAccessExpression(node);
+        }
+
         if (ts.isElementAccessExpression(node)) {
             return this.visitElementAccessExpression(node);
         }
@@ -488,6 +570,20 @@ export class ASTWalker {
         }
 
         const funcName = funcExpr.getText(this.sourceFile);
+
+        // Handle sizeof<T>() intrinsic
+        if (funcName === "sizeof" && node.typeArguments && node.typeArguments.length > 0) {
+            const typeArg = node.typeArguments[0];
+            const typeName = typeArg.getText(this.sourceFile);
+            const struct = this.structRegistry.get(typeName);
+
+            if (!struct) {
+                throw new Error(`sizeof: Unknown type '${typeName}'`);
+            }
+
+            // Return the struct size as a constant
+            return struct.size.toString();
+        }
 
         // Resolve the function: check importMap, then internal, then external
         let resolvedName: string;
@@ -587,6 +683,81 @@ export class ASTWalker {
         );
 
         return resultReg;
+    }
+
+    /**
+     * Get the storage address (L-value) of an expression
+     * Handles nested struct access recursively: line.start.x
+     * 
+     * Returns { ptr: LLVM register pointing to the value, type: LLVM type of the value }
+     */
+    private getStorageAddress(node: ts.Expression): { ptr: string; type: string } {
+        // CASE A: Variable identifier (base case)
+        if (ts.isIdentifier(node)) {
+            const name = node.getText(this.sourceFile);
+            const variable = this.context.lookupVariable(name);
+
+            if (!variable) {
+                throw new Error(`Undefined variable: ${name}`);
+            }
+
+            // Load the pointer from the stack variable
+            const loadedPtr = this.context.nextTemp();
+            this.emitter.emitLoad(loadedPtr, variable.llvmType, variable.llvmName);
+
+            // Return the pointer and the base type (without trailing *)
+            const baseType = variable.llvmType.replace(/\*$/, "");
+            return { ptr: loadedPtr, type: baseType };
+        }
+
+        // CASE B: Property access (recursive case): obj.field or obj.nested.field
+        if (ts.isPropertyAccessExpression(node)) {
+            // 1. Recursively get the parent's storage address
+            const parent = this.getStorageAddress(node.expression);
+
+            // 2. Get struct type name (e.g., "%Point" -> "Point")
+            const structType = parent.type.replace(/^\%/, "");
+            const fieldName = node.name.getText(this.sourceFile);
+
+            // 3. Look up the struct definition
+            const structDef = this.structRegistry.get(structType);
+            if (!structDef) {
+                throw new Error(`Unknown struct type: ${structType}`);
+            }
+
+            // 4. Find the field
+            const field = structDef.fields.find(f => f.name === fieldName);
+            if (!field) {
+                throw new Error(`Unknown field '${fieldName}' in struct '${structType}'`);
+            }
+
+            // 5. GEP to calculate field address
+            const fieldPtr = this.context.nextTemp();
+            const parentPtrType = parent.type.startsWith("%") ? `${parent.type}*` : `%${parent.type}*`;
+            this.emitter.emitLine(`${fieldPtr} = getelementptr %${structType}, ${parentPtrType} ${parent.ptr}, i32 0, i32 ${field.index}`);
+
+            // 6. Return the field pointer and its type (without trailing *)
+            const fieldBaseType = field.type.replace(/\*$/, "");
+            return { ptr: fieldPtr, type: fieldBaseType };
+        }
+
+        throw new Error(`Cannot get storage address for: ${ts.SyntaxKind[node.kind]}`);
+    }
+
+    /**
+     * Process a property access expression (obj.field or obj.nested.field)
+     * Used for reading struct fields - supports nested access
+     */
+    private visitPropertyAccessExpression(node: ts.PropertyAccessExpression): string {
+        // Get the storage address using recursive helper
+        const addr = this.getStorageAddress(node);
+
+        // Load the value from that address
+        const result = this.context.nextTemp();
+        const ptrType = addr.type.endsWith("*") ? addr.type : `${addr.type}*`;
+        this.emitter.emitLine(`${result} = load ${addr.type}, ${ptrType} ${addr.ptr}`);
+
+        return result;
     }
 
     /**
@@ -734,6 +905,15 @@ export class ASTWalker {
             return value;
         }
 
+        // Handle struct field assignment: obj.field = value (supports nesting)
+        if (ts.isPropertyAccessExpression(node.left)) {
+            // Use the recursive getStorageAddress helper
+            const addr = this.getStorageAddress(node.left);
+            const ptrType = addr.type.endsWith("*") ? addr.type : `${addr.type}*`;
+            this.emitter.emitLine(`store ${addr.type} ${value}, ${ptrType} ${addr.ptr}`);
+            return value;
+        }
+
         // Handle identifier assignment: x = value
         if (ts.isIdentifier(node.left)) {
             const name = node.left.getText(this.sourceFile);
@@ -747,7 +927,7 @@ export class ASTWalker {
             return value;
         }
 
-        throw new Error("Assignment target must be an identifier or array element");
+        throw new Error("Assignment target must be an identifier, array element, or struct field");
     }
 
     /**

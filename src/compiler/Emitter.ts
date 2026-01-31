@@ -6,6 +6,7 @@
 export class Emitter {
     private buffer: string[] = [];
     private declarations: string[] = [];  // External function declarations
+    private structTypes: string[] = [];   // Struct type definitions
     private stringConstants: Map<string, string> = new Map();  // String literals
     private stringCounter: number = 0;
     private indentLevel: number = 0;
@@ -125,6 +126,21 @@ export class Emitter {
     }
 
     /**
+     * Emit a bitcast instruction (type conversion)
+     */
+    emitBitcast(resultVar: string, fromType: string, value: string, toType: string): void {
+        this.emitLine(`${resultVar} = bitcast ${fromType} ${value} to ${toType}`);
+    }
+
+    /**
+     * Add a struct type definition
+     */
+    addStructType(name: string, fieldTypes: string[]): void {
+        const fields = fieldTypes.join(", ");
+        this.structTypes.push(`%${name} = type { ${fields} }`);
+    }
+
+    /**
      * Emit a store instruction
      */
     emitStore(type: string, value: string, ptr: string): void {
@@ -230,6 +246,14 @@ export class Emitter {
         // Module header is already in buffer
         const headerEnd = this.buffer.findIndex(line => line === "\n");
         output += this.buffer.slice(0, headerEnd + 1).join("");
+
+        // Add struct type definitions first
+        for (const structType of this.structTypes) {
+            output += structType + "\n";
+        }
+        if (this.structTypes.length > 0) {
+            output += "\n";
+        }
 
         // Add external declarations
         for (const decl of this.declarations) {
