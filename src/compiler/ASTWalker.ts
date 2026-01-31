@@ -46,6 +46,9 @@ export class ASTWalker {
     // Struct support
     private structRegistry: StructRegistry = new StructRegistry();
 
+    // Method support (UFCS): structName -> methodName -> function info
+    private methodRegistry: Map<string, Map<string, InternalFunction>> = new Map();
+
     constructor(sourceFile: ts.SourceFile, program: ts.Program, moduleName: string, emitter?: Emitter) {
         this.sourceFile = sourceFile;
         this.program = program;
@@ -172,19 +175,52 @@ export class ASTWalker {
         const returnType = this.getReturnType(node);
         const llvmReturnType = TypeMapper.mapType(returnType);
 
+        // Check if first parameter is "this" (method syntax)
+        let isMethod = false;
+        let structType = "";
+
+        if (node.parameters.length > 0) {
+            const firstParam = node.parameters[0];
+            const paramName = firstParam.name.getText(this.sourceFile);
+
+            if (paramName === "this" && firstParam.type) {
+                isMethod = true;
+                structType = firstParam.type.getText(this.sourceFile);
+            }
+        }
+
         // Process parameters
         const params: { name: string; type: string }[] = [];
         for (const param of node.parameters) {
             const paramName = param.name.getText(this.sourceFile);
             let paramType = "i32";
+
             if (param.type) {
-                paramType = TypeMapper.mapType(param.type.getText(this.sourceFile));
+                const tsType = param.type.getText(this.sourceFile);
+                // For "this" parameter, it's a pointer to the struct
+                if (paramName === "this" && this.structRegistry.get(tsType)) {
+                    paramType = `%${tsType}*`;
+                } else if (this.structRegistry.get(tsType)) {
+                    paramType = `%${tsType}*`;
+                } else {
+                    paramType = TypeMapper.mapType(tsType);
+                }
             }
             params.push({ name: paramName, type: paramType });
         }
 
-        // Compute mangled name: main stays as @main, others become @module_funcName
-        const mangledName = funcName === "main" ? "main" : `${this.currentModule}_${funcName}`;
+        // Compute mangled name:
+        // - main stays as @main
+        // - methods become @StructType_methodName (e.g., @Rect_area)
+        // - regular functions become @module_funcName
+        let mangledName: string;
+        if (funcName === "main") {
+            mangledName = "main";
+        } else if (isMethod && structType) {
+            mangledName = `${structType}_${funcName}`;
+        } else {
+            mangledName = `${this.currentModule}_${funcName}`;
+        }
 
         // Emit function start with parameters
         const paramStr = params.map(p => `${p.type} %${p.name}.param`).join(", ");
@@ -198,18 +234,35 @@ export class ASTWalker {
             this.emitter.emitStore(param.type, `%${param.name}.param`, variable.llvmName);
         }
 
-        // Register this function in internalFunctions for call resolution
-        // Key by local name so calls from same module resolve correctly
-        this.internalFunctions.set(funcName, {
+        // Register function
+        const funcInfo: InternalFunction = {
             name: funcName,
             mangledName,
             returnType: llvmReturnType,
             params,
-        });
+        };
+
+        // Register in appropriate registry
+        if (isMethod && structType) {
+            // Register as method
+            if (!this.methodRegistry.has(structType)) {
+                this.methodRegistry.set(structType, new Map());
+            }
+            this.methodRegistry.get(structType)!.set(funcName, funcInfo);
+        }
+
+        // Also register in internalFunctions for direct calls
+        this.internalFunctions.set(funcName, funcInfo);
 
         // Process function body
         if (node.body) {
             this.visitBlock(node.body);
+        }
+
+        // For void functions, ensure there's a ret void at the end
+        // (in case there's no explicit return statement)
+        if (llvmReturnType === "void") {
+            this.emitter.emitReturn("void", "");
         }
 
         // Emit function end
@@ -563,10 +616,16 @@ export class ASTWalker {
      * Process a function call expression
      */
     private visitCallExpression(node: ts.CallExpression): string {
-        // Get function name
         const funcExpr = node.expression;
+
+        // Handle method calls: obj.method(args)
+        if (ts.isPropertyAccessExpression(funcExpr)) {
+            return this.visitMethodCallExpression(node, funcExpr);
+        }
+
+        // Regular function call: funcName(args)
         if (!ts.isIdentifier(funcExpr)) {
-            throw new Error("Only direct function calls are supported");
+            throw new Error("Only direct function calls or method calls are supported");
         }
 
         const funcName = funcExpr.getText(this.sourceFile);
@@ -663,6 +722,74 @@ export class ASTWalker {
     }
 
     /**
+     * Process a method call expression: obj.method(args)
+     * Implements UFCS: rewrites to method(obj, args)
+     */
+    private visitMethodCallExpression(
+        node: ts.CallExpression,
+        funcExpr: ts.PropertyAccessExpression
+    ): string {
+        const objExpr = funcExpr.expression;
+        const methodName = funcExpr.name.getText(this.sourceFile);
+
+        // Get the object's type by looking up the variable
+        if (!ts.isIdentifier(objExpr)) {
+            throw new Error("Method calls only supported on direct identifiers");
+        }
+
+        const objName = objExpr.getText(this.sourceFile);
+        const variable = this.context.lookupVariable(objName);
+
+        if (!variable) {
+            throw new Error(`Undefined variable: ${objName}`);
+        }
+
+        // Extract struct type from variable type (e.g., "%Rect*" -> "Rect")
+        const structType = variable.llvmType.replace(/^\%/, "").replace(/\*$/, "");
+
+        // Look up the method in methodRegistry
+        const methods = this.methodRegistry.get(structType);
+        if (!methods || !methods.has(methodName)) {
+            throw new Error(`Unknown method '${methodName}' for type '${structType}'`);
+        }
+
+        const methodInfo = methods.get(methodName)!;
+
+        // Get the object pointer (this will be the first argument)
+        const objAddr = this.getStorageAddress(objExpr);
+
+        // Build arguments: first arg is the object pointer (this)
+        const args: string[] = [];
+
+        // First argument: the object pointer
+        const ptrType = objAddr.type.startsWith("%") ? `${objAddr.type}*` : `%${objAddr.type}*`;
+        args.push(`${ptrType} ${objAddr.ptr}`);
+
+        // Process remaining arguments
+        for (let i = 0; i < node.arguments.length; i++) {
+            const arg = node.arguments[i];
+            const value = this.visitExpression(arg);
+
+            // Get arg type from method params (offset by 1 for 'this')
+            let argType = "i32";
+            if (i + 1 < methodInfo.params.length) {
+                argType = methodInfo.params[i + 1].type;
+            }
+            args.push(`${argType} ${value}`);
+        }
+
+        const argsStr = args.join(", ");
+        const resultReg = methodInfo.returnType !== "void"
+            ? this.context.nextTemp()
+            : null;
+
+        // Emit the call
+        this.emitter.emitCall(resultReg, methodInfo.returnType, methodInfo.mangledName, argsStr);
+
+        return resultReg ?? "0";
+    }
+
+    /**
      * Process a string literal
      */
     private visitStringLiteral(node: ts.StringLiteral): string {
@@ -699,6 +826,23 @@ export class ASTWalker {
 
             if (!variable) {
                 throw new Error(`Undefined variable: ${name}`);
+            }
+
+            // Load the pointer from the stack variable
+            const loadedPtr = this.context.nextTemp();
+            this.emitter.emitLoad(loadedPtr, variable.llvmType, variable.llvmName);
+
+            // Return the pointer and the base type (without trailing *)
+            const baseType = variable.llvmType.replace(/\*$/, "");
+            return { ptr: loadedPtr, type: baseType };
+        }
+
+        // CASE A2: "this" keyword (for method context)
+        if (node.kind === ts.SyntaxKind.ThisKeyword) {
+            const variable = this.context.lookupVariable("this");
+
+            if (!variable) {
+                throw new Error(`'this' used outside of method context`);
             }
 
             // Load the pointer from the stack variable

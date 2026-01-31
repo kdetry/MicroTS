@@ -12,6 +12,7 @@ MicroTS is an experimental Ahead-of-Time (AOT) compiler that compiles a strict s
 - 📦 **Tiny Binaries** - Output depends only on libc
 - 📁 **ES Modules** - `import`/`export` support with name mangling
 - 🏗️ **Structs** - `interface` maps to LLVM structs with nested access
+- 🔨 **Methods** - `this` parameter enables `obj.method()` syntax (UFCS)
 
 ## Requirements
 
@@ -122,6 +123,7 @@ Options:
 | **Structs** | `interface Point { x: number; y: number; }` |
 | **sizeof** | `sizeof<Point>()` → compile-time size calculation |
 | **Nested Access** | `line.start.x = 10;` (arbitrary depth) |
+| **Methods** | `function area(this: Rect): number` → `r.area()` |
 
 ### ❌ Not Supported
 
@@ -162,6 +164,45 @@ free(vec);
 - Nested struct access: `line.start.x`
 - Heap allocation via `malloc`/`free`
 - Field read/write via `getelementptr`
+
+## Method System (UFCS)
+
+Functions with `this` as the first parameter become methods:
+
+```typescript
+interface Rect {
+    width: number;
+    height: number;
+}
+
+// "this: Rect" makes this a method on Rect
+function area(this: Rect): number {
+    return this.width * this.height;
+}
+
+function scale(this: Rect, factor: number): void {
+    this.width = this.width * factor;
+    this.height = this.height * factor;
+}
+
+function main(): number {
+    let r: Rect = malloc(sizeof<Rect>());
+    r.width = 10;
+    r.height = 20;
+    
+    r.scale(2);         // UFCS: compiles to scale(r, 2)
+    let a = r.area();   // UFCS: compiles to area(r)
+    
+    printf("Area: %d\n", a);  // 800
+    free(r);
+    return 0;
+}
+```
+
+**How it works:**
+- `function area(this: Rect)` → `@Rect_area(%Rect* %this)`
+- `r.area()` → `call @Rect_area(%Rect* %r)`
+- Static dispatch (no vtables), compile-time resolution
 
 ## Module System
 
@@ -210,6 +251,7 @@ Located in `examples/`:
 | `08-multifile` | Legacy multi-file |
 | `09-modules` | ES module imports |
 | `10-structs` | Interfaces & nested structs |
+| `11-methods` | Method syntax (UFCS) |
 
 ## Project Structure
 
