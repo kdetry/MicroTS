@@ -1,8 +1,4 @@
-// Array test - tests malloc, array access, and pointer arithmetic
-declare function printf(format: string, ...args: number[]): number;
-declare function malloc(size: number): number[];
-declare function free(ptr: number[]): void;
-
+// Array test - NO DECLARES NEEDED (auto-loaded from libc.ts)
 function main(): number {
     // Allocate array of 5 integers (5 * 4 bytes = 20 bytes)
     let arr: number[] = malloc(20);
@@ -26,5 +22,5 @@ function main(): number {
     // Free the memory
     free(arr);
 
-    return sum;  // Should return 150 (10+20+30+40+50)
+    return sum;  // Should return 150
 }

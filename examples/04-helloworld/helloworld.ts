@@ -1,5 +1,4 @@
-// Hello World - tests C FFI with printf
-declare function printf(format: string, ...args: number[]): number;
+// Hello World - NO DECLARE NEEDED (auto-loaded from libc.ts)
 
 function main(): number {
     printf("Hello, World!\\n");

@@ -10,6 +10,7 @@ MicroTS is an experimental Ahead-of-Time (AOT) compiler that compiles a strict s
 - ⚡ **Native Performance** - Compiles to machine code via LLVM/Clang
 - 🔧 **C Interop** - Call C standard library functions directly
 - 📦 **Tiny Binaries** - Output depends only on libc
+- 📁 **ES Modules** - `import`/`export` support with name mangling
 
 ## Requirements
 
@@ -37,34 +38,39 @@ npm install
 
 ## Quick Start
 
-### 1. Create a MicroTS program
+### Simple Program
 
 ```typescript
-// hello.ts
-declare function printf(format: string, ...args: number[]): number;
-
+// hello.ts - No imports needed, stdlib is auto-loaded
 function main(): number {
     printf("Hello, World!\n");
     return 0;
 }
 ```
 
-### 2. Compile and run
-
 ```bash
 npx ts-node src/cmd/main.ts hello.ts --run
 ```
 
-### 3. Output
+### With Modules
 
+```typescript
+// math.ts
+export function add(a: number, b: number): number {
+    return a + b;
+}
+
+// main.ts
+import { add } from './math';
+
+function main(): number {
+    printf("Result: %d\n", add(10, 20));
+    return 0;
+}
 ```
-Compiling: hello.ts
-Generated: hello.ll
-Compiled: hello
 
---- Running executable ---
-Hello, World!
-Exit code: 0
+```bash
+npx ts-node src/cmd/main.ts main.ts --run
 ```
 
 ## CLI Options
@@ -84,14 +90,15 @@ Options:
 
 | Feature | Example |
 |---------|---------|
-| Functions | `function add(a: number, b: number): number { return a + b; }` |
+| Functions | `function add(a: number, b: number): number { ... }` |
 | Variables | `let x: number = 42;` |
 | Arithmetic | `+`, `-`, `*`, `/`, `%` |
 | Comparisons | `<`, `>`, `<=`, `>=`, `==`, `!=` |
 | Control Flow | `if`, `else`, `while`, `for` |
-| C FFI | `declare function printf(fmt: string, ...args: number[]): number;` |
+| C FFI | `printf`, `malloc`, `free` (auto-loaded) |
 | Arrays | `let arr: number[] = malloc(20); arr[0] = 10;` |
 | Strings | `printf("Hello %d\n", 42);` |
+| **Modules** | `import { add } from './math'; export function add(...) {}` |
 
 ### ❌ Not Supported
 
@@ -101,6 +108,26 @@ Options:
 - `try`/`catch`
 - Union types (`string | number`)
 - `any` type
+
+## Module System
+
+MicroTS supports ES module imports with **name mangling**:
+
+```typescript
+// math.ts
+export function add(a: number, b: number): number { return a + b; }
+// → Compiles to: @math_add in LLVM IR
+
+// main.ts
+import { add } from './math';
+add(1, 2);  // → call i32 @math_add(i32 1, i32 2)
+```
+
+**Features:**
+- Automatic dependency resolution
+- Circular import detection
+- All modules compile into a single `.ll` file
+- `main()` is the entry point (never mangled)
 
 ## Type Mappings
 
@@ -114,71 +141,45 @@ Options:
 
 ## Examples
 
-### Fibonacci
+Located in `examples/`:
 
-```typescript
-declare function printf(format: string, ...args: number[]): number;
-
-function main(): number {
-    let a: number = 0;
-    let b: number = 1;
-    
-    for (let i: number = 0; i < 10; i = i + 1) {
-        let temp: number = a + b;
-        a = b;
-        b = temp;
-    }
-    
-    printf("Fibonacci(10) = %d\n", b);
-    return b;
-}
-```
-
-### Arrays with malloc
-
-```typescript
-declare function malloc(size: number): number[];
-declare function free(ptr: number[]): void;
-declare function printf(format: string, ...args: number[]): number;
-
-function main(): number {
-    let arr: number[] = malloc(20);  // 5 * 4 bytes
-    
-    arr[0] = 10;
-    arr[1] = 20;
-    arr[2] = 30;
-    
-    printf("Sum: %d\n", arr[0] + arr[1] + arr[2]);
-    
-    free(arr);
-    return 0;
-}
-```
+| Folder | Description |
+|--------|-------------|
+| `01-hello` | Return value |
+| `02-math` | Arithmetic |
+| `03-fibonacci` | While loop |
+| `04-helloworld` | printf |
+| `05-control-flow` | if/else |
+| `06-forloop` | For loop |
+| `07-arrays` | malloc/free |
+| `08-multifile` | Legacy multi-file |
+| `09-modules` | ES module imports |
 
 ## Project Structure
 
 ```
 src/
-├── cmd/main.ts           # CLI entry point
+├── cmd/main.ts             # CLI entry point
 ├── compiler/
-│   ├── ASTWalker.ts      # TypeScript AST → LLVM IR
-│   ├── Emitter.ts        # LLVM IR string builder
-│   ├── Context.ts        # Symbol table / scopes
-│   └── TypeMapper.ts     # TS types → LLVM types
-├── stdlib/libc.ts        # C FFI declarations
-└── utils/SystemRunner.ts # Clang execution wrapper
+│   ├── ASTWalker.ts        # TypeScript AST → LLVM IR
+│   ├── Emitter.ts          # LLVM IR string builder
+│   ├── Context.ts          # Symbol table / scopes
+│   ├── TypeMapper.ts       # TS types → LLVM types
+│   └── ModuleResolver.ts   # Import/export resolution
+├── stdlib/libc.ts          # C FFI declarations (auto-loaded)
+└── utils/SystemRunner.ts   # Clang execution wrapper
 ```
 
 ## How It Works
 
 ```
-┌─────────┐     ┌─────────┐     ┌─────────┐     ┌────────────┐
-│ .ts     │ ──▶ │  AST    │ ──▶ │  .ll    │ ──▶ │ executable │
-│ source  │     │ (TS API)│     │ (LLVM)  │     │ (native)   │
-└─────────┘     └─────────┘     └─────────┘     └────────────┘
-                    ▲               ▲                ▲
-              TypeScript        Emitter           Clang
-              Compiler API      + Walker
+┌──────────┐     ┌───────────────┐     ┌─────────┐     ┌────────────┐
+│  main.ts │ ──▶ │ ModuleResolver│ ──▶ │  .ll    │ ──▶ │ executable │
+│  math.ts │     │ + ASTWalker   │     │ (LLVM)  │     │ (native)   │
+└──────────┘     └───────────────┘     └─────────┘     └────────────┘
+                        │
+                   Name Mangling
+                   math.add → @math_add
 ```
 
 ## License

@@ -2,6 +2,7 @@ import * as ts from "typescript";
 import { Emitter } from "./Emitter";
 import { Context } from "./Context";
 import { TypeMapper } from "./TypeMapper";
+import { ImportInfo } from "./ModuleResolver";
 
 /**
  * ExternFunction - Tracks declared external functions (C FFI)
@@ -14,9 +15,19 @@ interface ExternFunction {
 }
 
 /**
+ * InternalFunction - Tracks user-defined functions
+ */
+interface InternalFunction {
+    name: string;
+    mangledName: string;    // Name in LLVM IR (e.g., "math_add")
+    returnType: string;
+    params: { name: string; type: string }[];
+}
+
+/**
  * ASTWalker - Traverses TypeScript AST and generates LLVM IR
  * 
- * Phase 1-3: Handles functions, variables, expressions, and C FFI
+ * Phase 1-6: Handles functions, variables, expressions, C FFI, and modules
  */
 export class ASTWalker {
     private emitter: Emitter;
@@ -25,13 +36,40 @@ export class ASTWalker {
     private typeChecker: ts.TypeChecker;
     private context: Context;
     private externFunctions: Map<string, ExternFunction> = new Map();
+    private internalFunctions: Map<string, InternalFunction> = new Map();
 
-    constructor(sourceFile: ts.SourceFile, program: ts.Program, moduleName: string) {
+    // Module support
+    private currentModule: string = "main";
+    private importMap: Map<string, string> = new Map();  // localName → mangledName
+
+    constructor(sourceFile: ts.SourceFile, program: ts.Program, moduleName: string, emitter?: Emitter) {
         this.sourceFile = sourceFile;
         this.program = program;
         this.typeChecker = program.getTypeChecker();
-        this.emitter = new Emitter(moduleName);
+        this.emitter = emitter || new Emitter(moduleName);
         this.context = new Context();
+        this.currentModule = moduleName;
+    }
+
+    /**
+     * Set the shared function registries (for multi-module compilation)
+     */
+    setSharedRegistries(
+        externFunctions: Map<string, ExternFunction>,
+        internalFunctions: Map<string, InternalFunction>
+    ): void {
+        this.externFunctions = externFunctions;
+        this.internalFunctions = internalFunctions;
+    }
+
+    /**
+     * Register imports for symbol resolution
+     */
+    registerImports(imports: ImportInfo[]): void {
+        for (const imp of imports) {
+            const mangledName = `${imp.fromModule}_${imp.exportedName}`;
+            this.importMap.set(imp.localName, mangledName);
+        }
     }
 
     /**
@@ -117,8 +155,40 @@ export class ASTWalker {
         const returnType = this.getReturnType(node);
         const llvmReturnType = TypeMapper.mapType(returnType);
 
-        // Emit function start
-        this.emitter.emitFunctionStart(funcName, llvmReturnType);
+        // Process parameters
+        const params: { name: string; type: string }[] = [];
+        for (const param of node.parameters) {
+            const paramName = param.name.getText(this.sourceFile);
+            let paramType = "i32";
+            if (param.type) {
+                paramType = TypeMapper.mapType(param.type.getText(this.sourceFile));
+            }
+            params.push({ name: paramName, type: paramType });
+        }
+
+        // Compute mangled name: main stays as @main, others become @module_funcName
+        const mangledName = funcName === "main" ? "main" : `${this.currentModule}_${funcName}`;
+
+        // Emit function start with parameters
+        const paramStr = params.map(p => `${p.type} %${p.name}.param`).join(", ");
+        this.emitter.emitLine(`define ${llvmReturnType} @${mangledName}(${paramStr}) {`);
+        this.emitter.emitLine("entry:");
+
+        // Allocate stack space for parameters and store the incoming values
+        for (const param of params) {
+            const variable = this.context.declareVariable(param.name, param.type);
+            this.emitter.emitAlloca(variable.llvmName, param.type);
+            this.emitter.emitStore(param.type, `%${param.name}.param`, variable.llvmName);
+        }
+
+        // Register this function in internalFunctions for call resolution
+        // Key by local name so calls from same module resolve correctly
+        this.internalFunctions.set(funcName, {
+            name: funcName,
+            mangledName,
+            returnType: llvmReturnType,
+            params,
+        });
 
         // Process function body
         if (node.body) {
@@ -419,16 +489,44 @@ export class ASTWalker {
 
         const funcName = funcExpr.getText(this.sourceFile);
 
-        // Check if this is an external function
-        const externFunc = this.externFunctions.get(funcName);
+        // Resolve the function: check importMap, then internal, then external
+        let resolvedName: string;
+        let funcInfo: ExternFunction | InternalFunction | undefined;
+        let isVariadic = false;
 
-        if (!externFunc) {
+        // 1. Check if this was imported from another module
+        if (this.importMap.has(funcName)) {
+            resolvedName = this.importMap.get(funcName)!;
+            // Find the function info by checking all internal functions
+            for (const [, func] of this.internalFunctions) {
+                if (func.mangledName === resolvedName) {
+                    funcInfo = func;
+                    break;
+                }
+            }
+        }
+        // 2. Check internal functions (local to this module)
+        else if (this.internalFunctions.has(funcName)) {
+            funcInfo = this.internalFunctions.get(funcName);
+            resolvedName = (funcInfo as InternalFunction).mangledName;
+        }
+        // 3. Check external functions (C FFI)
+        else if (this.externFunctions.has(funcName)) {
+            funcInfo = this.externFunctions.get(funcName);
+            resolvedName = funcName;  // External functions keep their original name
+            isVariadic = (funcInfo as ExternFunction).isVariadic;
+        }
+        // 4. Not found
+        else {
             throw new Error(`Unknown function: ${funcName}`);
+        }
+
+        if (!funcInfo) {
+            throw new Error(`Could not resolve function info for: ${funcName} (resolved to ${resolvedName})`);
         }
 
         // Process arguments
         const args: string[] = [];
-        const argTypes: string[] = [];
 
         for (let i = 0; i < node.arguments.length; i++) {
             const arg = node.arguments[i];
@@ -436,37 +534,36 @@ export class ASTWalker {
 
             // Determine argument type
             let argType = "i32";  // Default
-            if (i < externFunc.params.length) {
-                argType = externFunc.params[i].type;
+            if (i < funcInfo.params.length) {
+                argType = funcInfo.params[i].type;
             } else if (ts.isStringLiteral(arg)) {
                 argType = "i8*";
             }
 
             args.push(`${argType} ${value}`);
-            argTypes.push(argType);
         }
 
         const argsStr = args.join(", ");
         const resultReg = this.context.nextTemp();
 
-        // Emit the call
-        if (externFunc.isVariadic) {
+        // Emit the call with the resolved/mangled name
+        if (isVariadic) {
             this.emitter.emitVariadicCall(
-                externFunc.returnType !== "void" ? resultReg : null,
-                externFunc.returnType,
-                funcName,
+                funcInfo.returnType !== "void" ? resultReg : null,
+                funcInfo.returnType,
+                resolvedName,
                 argsStr
             );
         } else {
             this.emitter.emitCall(
-                externFunc.returnType !== "void" ? resultReg : null,
-                externFunc.returnType,
-                funcName,
+                funcInfo.returnType !== "void" ? resultReg : null,
+                funcInfo.returnType,
+                resolvedName,
                 argsStr
             );
         }
 
-        return externFunc.returnType !== "void" ? resultReg : "0";
+        return funcInfo.returnType !== "void" ? resultReg : "0";
     }
 
     /**
@@ -730,18 +827,167 @@ export class ASTWalker {
 
         return "void";
     }
+
+    /**
+     * Load stdlib declarations from a prelude file (e.g., libc.ts)
+     * This allows users to use printf, malloc, etc. without declaring them
+     * Also supports multifile: loads function definitions from sibling files
+     */
+    loadPrelude(preludePath: string): void {
+        const fs = require("fs");
+
+        if (!fs.existsSync(preludePath)) {
+            return;  // No prelude file, skip silently
+        }
+
+        // Parse the prelude file
+        const preludeProgram = ts.createProgram([preludePath], {
+            target: ts.ScriptTarget.ES2022,
+            module: ts.ModuleKind.ESNext,
+            strict: false,
+            skipLibCheck: true,
+            skipDefaultLibCheck: true,
+        });
+
+        const preludeSource = preludeProgram.getSourceFile(preludePath);
+        if (!preludeSource) {
+            return;
+        }
+
+        // Save original source file reference
+        const originalSource = this.sourceFile;
+
+        // Process all functions from the prelude
+        ts.forEachChild(preludeSource, (node) => {
+            if (ts.isFunctionDeclaration(node)) {
+                if (!node.body) {
+                    // External declaration (declare function)
+                    this.visitDeclareFunctionFromSource(node, preludeSource);
+                } else {
+                    // Function with body - compile it
+                    this.sourceFile = preludeSource;
+                    this.visitFunctionDeclaration(node);
+                }
+            }
+        });
+
+        // Restore original source file
+        this.sourceFile = originalSource;
+    }
+
+    /**
+     * Process a declare function from a different source file
+     */
+    private visitDeclareFunctionFromSource(node: ts.FunctionDeclaration, source: ts.SourceFile): void {
+        const funcName = node.name?.getText(source);
+        if (!funcName) return;
+
+        // Get return type
+        let returnType = "number";
+        if (node.type) {
+            returnType = node.type.getText(source);
+        }
+        const llvmReturnType = TypeMapper.mapType(returnType);
+
+        // Get parameters
+        const params: { name: string; type: string }[] = [];
+        let isVariadic = false;
+
+        for (const param of node.parameters) {
+            if (param.dotDotDotToken) {
+                isVariadic = true;
+                continue;
+            }
+
+            const paramName = param.name.getText(source);
+            let paramType = "i32";
+            if (param.type) {
+                paramType = TypeMapper.mapType(param.type.getText(source));
+            }
+            params.push({ name: paramName, type: paramType });
+        }
+
+        // Store extern function info
+        this.externFunctions.set(funcName, {
+            name: funcName,
+            returnType: llvmReturnType,
+            params,
+            isVariadic,
+        });
+
+        // Emit the extern declaration
+        const paramTypes = params.map(p => p.type).join(", ");
+        this.emitter.addExternFunction(funcName, llvmReturnType, paramTypes, isVariadic);
+    }
 }
 
 /**
  * Compile a TypeScript source file to LLVM IR
+ * Supports ES module imports - resolves dependencies and compiles all into one .ll file
  */
 export function compileToIR(sourceFilePath: string): string {
+    const fs = require("fs");
+    const path = require("path");
+    const { ModuleResolver } = require("./ModuleResolver");
+
+    // Check if the file has imports
+    const sourceContent = fs.readFileSync(sourceFilePath, "utf-8");
+    const hasImports = sourceContent.includes("import ");
+
+    if (hasImports) {
+        // Use ModuleResolver for import-based multi-module compilation
+        return compileWithModules(sourceFilePath);
+    } else {
+        // Legacy single-file + sibling compilation (backward compatible)
+        return compileSingleFile(sourceFilePath);
+    }
+}
+
+/**
+ * Compile with proper ES module import support
+ */
+function compileWithModules(entryPath: string): string {
+    const path = require("path");
+    const { ModuleResolver } = require("./ModuleResolver");
+
+    // Resolve all dependencies
+    const resolver = new ModuleResolver(entryPath);
+    const modules = resolver.resolve();
+
+    // Create shared emitter and registries
+    const emitter = new Emitter("program");
+    const externFunctions = new Map();
+    const internalFunctions = new Map();
+
+    // Load stdlib prelude first
+    const libcPath = path.join(__dirname, "../stdlib/libc.ts");
+    const preludeWalker = new ASTWalker(modules[0].sourceFile, modules[0].program, "stdlib", emitter);
+    preludeWalker.setSharedRegistries(externFunctions, internalFunctions);
+    preludeWalker.loadPrelude(libcPath);
+
+    // Process each module in dependency order
+    for (const mod of modules) {
+        const walker = new ASTWalker(mod.sourceFile, mod.program, mod.name, emitter);
+        walker.setSharedRegistries(externFunctions, internalFunctions);
+        walker.registerImports(mod.imports);
+        walker.walk();
+    }
+
+    return emitter.getOutput();
+}
+
+/**
+ * Legacy single-file compilation (for files without imports)
+ */
+function compileSingleFile(sourceFilePath: string): string {
+    const fs = require("fs");
+    const path = require("path");
+
     // Create a program with just this file
-    // We use minimal options since MicroTS handles its own type mapping
     const program = ts.createProgram([sourceFilePath], {
         target: ts.ScriptTarget.ES2022,
         module: ts.ModuleKind.ESNext,
-        strict: false,  // We do our own type checking
+        strict: false,
         skipLibCheck: true,
         skipDefaultLibCheck: true,
     });
@@ -752,8 +998,7 @@ export function compileToIR(sourceFilePath: string): string {
         throw new Error(`Could not load source file: ${sourceFilePath}`);
     }
 
-    // Only check for syntax errors, not semantic errors
-    // MicroTS has its own type system (maps to LLVM types)
+    // Check for syntax errors
     const syntaxDiagnostics = program.getSyntacticDiagnostics(sourceFile);
     if (syntaxDiagnostics.length > 0) {
         const messages = syntaxDiagnostics.map((d) => {
@@ -767,10 +1012,25 @@ export function compileToIR(sourceFilePath: string): string {
         throw new Error(`Syntax errors:\n${messages.join("\n")}`);
     }
 
-    // Extract module name from file path
     const moduleName = sourceFilePath.split("/").pop()?.replace(".ts", "") || "module";
-
-    // Walk the AST and generate IR
     const walker = new ASTWalker(sourceFile, program, moduleName);
+
+    // Load stdlib prelude
+    const libcPath = path.join(__dirname, "../stdlib/libc.ts");
+    walker.loadPrelude(libcPath);
+
+    // Load sibling files (legacy behavior)
+    const sourceDir = path.dirname(sourceFilePath);
+    const sourceBasename = path.basename(sourceFilePath);
+    const siblingFiles = fs.readdirSync(sourceDir)
+        .filter((f: string) => f.endsWith(".ts") && f !== sourceBasename)
+        .sort();
+
+    for (const sibling of siblingFiles) {
+        const siblingPath = path.join(sourceDir, sibling);
+        walker.loadPrelude(siblingPath);
+    }
+
     return walker.walk();
 }
+

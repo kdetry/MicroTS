@@ -13,14 +13,16 @@ build/
 *.o
 *.s
 
-# Compiled executables (no extension on macOS/Linux)
-examples/hello
-examples/math
-examples/fibonacci
-examples/helloworld
-examples/control_flow
-examples/forloop
-examples/arrays
+# Compiled executables in examples (no extension on macOS/Linux)
+examples/*/hello
+examples/*/math
+examples/*/fibonacci
+examples/*/helloworld
+examples/*/control_flow
+examples/*/forloop
+examples/*/arrays
+examples/*/main
+examples/*/*.ll
 
 # OS files
 .DS_Store
