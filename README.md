@@ -13,6 +13,7 @@ MicroTS is an experimental Ahead-of-Time (AOT) compiler that compiles a strict s
 - 📁 **ES Modules** - `import`/`export` support with name mangling
 - 🏗️ **Structs** - `interface` maps to LLVM structs with nested access
 - 🔨 **Methods** - `this` parameter enables `obj.method()` syntax (UFCS)
+- 🔮 **Generics** - Monomorphization of generic interfaces at compile time
 
 ## Requirements
 
@@ -94,6 +95,42 @@ function main(): number {
 npx ts-node src/cmd/main.ts main.ts --run
 ```
 
+### With Generics
+
+```typescript
+interface Box<T> {
+    id: number;
+    value: T;
+}
+
+interface Pair<T, U> {
+    first: T;
+    second: U;
+}
+
+function main(): number {
+    // Single type parameter
+    let intBox: Box<number> = malloc(sizeof<Box<number>>());
+    intBox.id = 1;
+    intBox.value = 42;
+    printf("Box: id=%d, value=%d\n", intBox.id, intBox.value);
+    free(intBox);
+
+    // Multiple type parameters
+    let pair: Pair<number, number> = malloc(sizeof<Pair<number, number>>());
+    pair.first = 10;
+    pair.second = 20;
+    printf("Pair: first=%d, second=%d\n", pair.first, pair.second);
+    free(pair);
+
+    return 0;
+}
+```
+
+```bash
+npx ts-node src/cmd/main.ts main.ts --run
+```
+
 ## CLI Options
 
 ```bash
@@ -121,6 +158,7 @@ Options:
 | Strings | `printf("Hello %d\n", 42);` |
 | **Modules** | `import { add } from './math'; export function add(...) {}` |
 | **Structs** | `interface Point { x: number; y: number; }` |
+| **Generics** | `interface Box<T> { value: T; }` with monomorphization |
 | **sizeof** | `sizeof<Point>()` → compile-time size calculation |
 | **Nested Access** | `line.start.x = 10;` (arbitrary depth) |
 | **Methods** | `function area(this: Rect): number` → `r.area()` |
@@ -204,6 +242,33 @@ function main(): number {
 - `r.area()` → `call @Rect_area(%Rect* %r)`
 - Static dispatch (no vtables), compile-time resolution
 
+## Generic System
+
+Generic interfaces are instantiated at compile time via **monomorphization**:
+
+```typescript
+interface Box<T> {
+    id: number;
+    value: T;
+}
+
+let intBox: Box<number> = malloc(sizeof<Box<number>>());
+let numPair: Pair<number, number> = malloc(sizeof<Pair<number, number>>());
+```
+
+**Generated LLVM IR:**
+```llvm
+%Box_i32 = type { i32, i32 }
+%Pair_i32_i32 = type { i32, i32 }
+```
+
+**Features:**
+- Single type parameters: `Box<number>` → `Box_i32`
+- Multiple type parameters: `Pair<i32, f64>` → `Pair_i32_f64`
+- Nested generics: `Box<Box<number>>` → `Box_Box_i32`
+- Type name mangling: `T` replaced with concrete types
+- Zero runtime overhead (all generics resolved at compile time)
+
 ## Module System
 
 MicroTS supports ES module imports with **name mangling**:
@@ -234,6 +299,8 @@ add(1, 2);  // → call i32 @math_add(i32 1, i32 2)
 | `string` | `i8*` |
 | `number[]` | `i32*` |
 | `interface X` | `%X*` (pointer to struct) |
+| `Box<number>` | `%Box_i32*` (mangled generic) |
+| `Pair<T, U>` | `%Pair_T_U*` (instantiated struct) |
 
 ## Examples
 
@@ -252,6 +319,9 @@ Located in `examples/`:
 | `09-modules` | ES module imports |
 | `10-structs` | Interfaces & nested structs |
 | `11-methods` | Method syntax (UFCS) |
+| `12-generics` | Generic interfaces (monomorphization) |
+| `12a-generics-advanced` | Multiple type parameters |
+| `12b-generics-nested` | Nested generic types |
 
 ## Project Structure
 
@@ -263,7 +333,9 @@ src/
 │   ├── Emitter.ts          # LLVM IR string builder
 │   ├── Context.ts          # Symbol table / scopes
 │   ├── TypeMapper.ts       # TS types → LLVM types
+│   ├── TypeResolver.ts     # Generic type parsing
 │   ├── ModuleResolver.ts   # Import/export resolution
+│   ├── GenericRegistry.ts  # Generic blueprint storage
 │   └── StructRegistry.ts   # Interface → struct mapping
 ├── stdlib/libc.ts          # C FFI declarations (auto-loaded)
 └── utils/SystemRunner.ts   # Clang execution wrapper
@@ -273,12 +345,13 @@ src/
 
 ```
 ┌──────────┐     ┌───────────────┐     ┌─────────┐     ┌────────────┐
-│  main.ts │ ──▶ │ StructRegistry│ ──▶ │  .ll    │ ──▶ │ executable │
-│  math.ts │     │ + ASTWalker   │     │ (LLVM)  │     │ (native)   │
-└──────────┘     └───────────────┘     └─────────┘     └────────────┘
-                        │
-                  Struct Types
-                  interface Point → %Point = type { i32, i32 }
+│  main.ts │ ──▶ │ GenericRegistry│ ──▶ │  .ll    │ ──▶ │ executable │
+│          │     │ StructRegistry│     │ (LLVM)  │     │ (native)   │
+└──────────┘     │   ASTWalker   │     └─────────┘     └────────────┘
+                 └───────────────┘           │
+                        │                 Monomorphization
+                  Generic Types          Box<number> → Box_i32
+                  interface Box<T>       Pair<T,U> → Pair_i32_i32
 ```
 
 ## License
