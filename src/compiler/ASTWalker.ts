@@ -4,6 +4,8 @@ import { Context } from "./Context";
 import { TypeMapper } from "./TypeMapper";
 import { ImportInfo } from "./ModuleResolver";
 import { StructRegistry } from "./StructRegistry";
+import { GenericRegistry } from "./GenericRegistry";
+import { TypeResolver, ParsedTypeReference } from "./TypeResolver";
 
 /**
  * ExternFunction - Tracks declared external functions (C FFI)
@@ -49,6 +51,10 @@ export class ASTWalker {
     // Method support (UFCS): structName -> methodName -> function info
     private methodRegistry: Map<string, Map<string, InternalFunction>> = new Map();
 
+    // Generic support
+    private genericRegistry: GenericRegistry = new GenericRegistry();
+    private typeResolver: TypeResolver = new TypeResolver();
+
     constructor(sourceFile: ts.SourceFile, program: ts.Program, moduleName: string, emitter?: Emitter) {
         this.sourceFile = sourceFile;
         this.program = program;
@@ -90,12 +96,6 @@ export class ASTWalker {
             }
         });
 
-        // Emit struct types to IR
-        for (const struct of this.structRegistry.getTopologicalOrder()) {
-            const fieldTypes = struct.fields.map(f => f.type);
-            this.emitter.addStructType(struct.name, fieldTypes);
-        }
-
         // Second pass: collect all declare statements (external functions)
         ts.forEachChild(this.sourceFile, (node) => {
             if (ts.isFunctionDeclaration(node) && !node.body) {
@@ -105,11 +105,18 @@ export class ASTWalker {
         });
 
         // Third pass: process all function definitions
+        // This will trigger instantiation of generics used in function bodies
         ts.forEachChild(this.sourceFile, (node) => {
             if (ts.isFunctionDeclaration(node) && node.body) {
                 this.visitFunctionDeclaration(node);
             }
         });
+
+        // Emit struct types to IR (after generic instantiation)
+        for (const struct of this.structRegistry.getTopologicalOrder()) {
+            const fieldTypes = struct.fields.map(f => f.type);
+            this.emitter.addStructType(struct.name, fieldTypes);
+        }
 
         return this.emitter.getOutput();
     }
@@ -275,6 +282,15 @@ export class ASTWalker {
     private visitInterfaceDeclaration(node: ts.InterfaceDeclaration): void {
         const interfaceName = node.name.getText(this.sourceFile);
 
+        // Check if this is a generic interface
+        if (node.typeParameters && node.typeParameters.length > 0) {
+            // This is a generic interface - register as blueprint
+            const typeParams = node.typeParameters.map(tp => tp.name.getText(this.sourceFile));
+            this.genericRegistry.registerInterface(interfaceName, typeParams, node, this.sourceFile);
+            return;
+        }
+
+        // Non-generic interface - process as regular struct
         const fields: { name: string; tsType: string; llvmType: string }[] = [];
 
         for (const member of node.members) {
@@ -363,7 +379,7 @@ export class ASTWalker {
         let structTypeName = "";
 
         if (node.type) {
-            const tsType = node.type.getText(this.sourceFile);
+            const tsType = this.resolveTypeName(node.type);
 
             // Check if this is a struct type
             if (this.structRegistry.get(tsType)) {
@@ -633,11 +649,11 @@ export class ASTWalker {
         // Handle sizeof<T>() intrinsic
         if (funcName === "sizeof" && node.typeArguments && node.typeArguments.length > 0) {
             const typeArg = node.typeArguments[0];
-            const typeName = typeArg.getText(this.sourceFile);
-            const struct = this.structRegistry.get(typeName);
+            const resolvedTypeName = this.resolveTypeName(typeArg);
+            const struct = this.structRegistry.get(resolvedTypeName);
 
             if (!struct) {
-                throw new Error(`sizeof: Unknown type '${typeName}'`);
+                throw new Error(`sizeof: Unknown type '${resolvedTypeName}' (resolved from ${typeArg.getText(this.sourceFile)})`);
             }
 
             // Return the struct size as a constant
@@ -860,7 +876,8 @@ export class ASTWalker {
             const parent = this.getStorageAddress(node.expression);
 
             // 2. Get struct type name (e.g., "%Point" -> "Point")
-            const structType = parent.type.replace(/^\%/, "");
+            // Remove leading % and trailing * for struct lookup
+            const structType = parent.type.replace(/^\%/, "").replace(/\*$/, "");
             const fieldName = node.name.getText(this.sourceFile);
 
             // 3. Look up the struct definition
@@ -880,9 +897,9 @@ export class ASTWalker {
             const parentPtrType = parent.type.startsWith("%") ? `${parent.type}*` : `%${parent.type}*`;
             this.emitter.emitLine(`${fieldPtr} = getelementptr %${structType}, ${parentPtrType} ${parent.ptr}, i32 0, i32 ${field.index}`);
 
-            // 6. Return the field pointer and its type (without trailing *)
-            const fieldBaseType = field.type.replace(/\*$/, "");
-            return { ptr: fieldPtr, type: fieldBaseType };
+            // 6. Return the field pointer and its type
+            // Keep the full type including trailing * for pointer fields
+            return { ptr: fieldPtr, type: field.type };
         }
 
         throw new Error(`Cannot get storage address for: ${ts.SyntaxKind[node.kind]}`);
@@ -1054,7 +1071,19 @@ export class ASTWalker {
             // Use the recursive getStorageAddress helper
             const addr = this.getStorageAddress(node.left);
             const ptrType = addr.type.endsWith("*") ? addr.type : `${addr.type}*`;
-            this.emitter.emitLine(`store ${addr.type} ${value}, ${ptrType} ${addr.ptr}`);
+
+            // Special handling for malloc: need to cast i32* to struct pointer type
+            // Check if target is a struct pointer field
+            if (addr.type.startsWith("%")) {
+                // Target is a struct or struct pointer field
+                // malloc returns i32*, need to bitcast to correct type
+                const castedReg = this.context.nextTemp();
+                this.emitter.emitBitcast(castedReg, "i32*", value, ptrType);
+                // Store with the casted pointer type, not the base type
+                this.emitter.emitLine(`store ${ptrType} ${castedReg}, ${ptrType}* ${addr.ptr}`);
+            } else {
+                this.emitter.emitLine(`store ${addr.type} ${value}, ${ptrType} ${addr.ptr}`);
+            }
             return value;
         }
 
@@ -1150,6 +1179,144 @@ export class ASTWalker {
         }
 
         return "void";
+    }
+
+    /**
+     * Resolve a type name, handling generics if present
+     * Returns the mangled name for concrete generic instantiations
+     */
+    private resolveTypeName(typeNode: ts.TypeNode): string {
+        const parsed = this.typeResolver.parseTypeNode(typeNode, this.sourceFile);
+
+        if (!parsed.isGeneric) {
+            // Not a generic type - return as-is
+            return parsed.text;
+        }
+
+        // This is a generic type like Box<number>
+        // Check if it's a generic interface blueprint
+        if (!this.genericRegistry.isGenericInterface(parsed.baseName)) {
+            // Not a generic interface we know about - maybe a nested generic or error
+            return parsed.text;
+        }
+
+        // Get the mangled name (e.g., Box<number> -> Box_i32)
+        const mangledName = this.typeResolver.getMangledName(parsed, TypeMapper.mapType);
+
+        // Check if already instantiated
+        if (this.structRegistry.isStruct(mangledName)) {
+            return mangledName;
+        }
+
+        // Need to instantiate this generic
+        this.instantiateGeneric(parsed.baseName, mangledName, parsed);
+
+        return mangledName;
+    }
+
+    /**
+     * Instantiate a generic interface with concrete type arguments
+     * Creates a concrete struct in the StructRegistry
+     */
+    private instantiateGeneric(
+        baseName: string,
+        mangledName: string,
+        parsed: ParsedTypeReference
+    ): void {
+        // Check if already being instantiated (avoid cycles)
+        if (this.genericRegistry.isInstantiated(mangledName)) {
+            return;
+        }
+
+        const blueprint = this.genericRegistry.getInterface(baseName);
+        if (!blueprint) {
+            throw new Error(`Generic interface blueprint not found: ${baseName}`);
+        }
+
+        // Get type parameter names
+        const typeParams = blueprint.typeParams;
+
+        // Build substitution map: type param name -> concrete type mangled name
+        // Also recursively instantiate nested generics in type arguments
+        const typeSubst: Record<string, string> = {};
+        for (let i = 0; i < typeParams.length && i < parsed.typeArgs.length; i++) {
+            const paramName = typeParams[i];
+            const typeArg = parsed.typeArgs[i];
+
+            // If the type argument is itself a generic, recursively instantiate it first
+            if (typeArg.isGeneric) {
+                const argMangledName = this.typeResolver.getMangledName(typeArg, TypeMapper.mapType);
+                if (this.genericRegistry.isGenericInterface(typeArg.baseName) &&
+                    !this.structRegistry.isStruct(argMangledName)) {
+                    // Recursively instantiate the type argument
+                    this.instantiateGeneric(typeArg.baseName, argMangledName, typeArg);
+                }
+                typeSubst[paramName] = argMangledName;
+            } else {
+                typeSubst[paramName] = this.typeResolver.getMangledName(typeArg, TypeMapper.mapType);
+            }
+        }
+
+        // Process each field from the blueprint
+        const fields: { name: string; tsType: string; llvmType: string }[] = [];
+
+        for (const member of blueprint.node.members) {
+            if (!ts.isPropertySignature(member)) {
+                continue;
+            }
+
+            const fieldName = member.name.getText(blueprint.sourceFile);
+            let tsType = "number";
+            let llvmType = "i32";
+
+            if (member.type) {
+                const originalTypeText = member.type.getText(blueprint.sourceFile);
+                tsType = originalTypeText;
+
+                // Check if the field type is a type parameter
+                if (typeParams.includes(originalTypeText)) {
+                    // Substitute with concrete type
+                    const concreteType = typeSubst[originalTypeText];
+                    if (concreteType) {
+                        tsType = concreteType;
+                        // Check if the concrete type is a struct (pointer or regular)
+                        if (this.structRegistry.isStruct(concreteType)) {
+                            llvmType = `%${concreteType}*`;
+                        } else {
+                            llvmType = TypeMapper.mapType(concreteType);
+                        }
+                    }
+                } else {
+                    // Not a type parameter - check if it's another struct or generic
+                    if (this.structRegistry.isStruct(originalTypeText)) {
+                        llvmType = `%${originalTypeText}*`;
+                    } else if (originalTypeText.includes("<")) {
+                        // This field uses another generic type - recursively resolve it
+                        const fieldParsed = this.typeResolver.parseTypeNode(member.type, blueprint.sourceFile);
+                        if (fieldParsed.isGeneric) {
+                            const fieldMangled = this.typeResolver.getMangledName(fieldParsed, TypeMapper.mapType);
+                            // Recursively instantiate if needed
+                            if (this.genericRegistry.isGenericInterface(fieldParsed.baseName) &&
+                                !this.structRegistry.isStruct(fieldMangled)) {
+                                this.instantiateGeneric(fieldParsed.baseName, fieldMangled, fieldParsed);
+                            }
+                            tsType = fieldMangled;
+                            llvmType = `%${fieldMangled}*`;
+                        } else {
+                            llvmType = TypeMapper.mapType(originalTypeText);
+                        }
+                    } else {
+                        llvmType = TypeMapper.mapType(originalTypeText);
+                    }
+                }
+            }
+
+            fields.push({ name: fieldName, tsType, llvmType });
+        }
+
+        // Register the instantiated struct
+        this.structRegistry.register(mangledName, fields);
+        this.genericRegistry.markInstantiated(mangledName);
     }
 
     /**
